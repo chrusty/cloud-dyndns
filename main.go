@@ -2,19 +2,28 @@ package main
 
 import (
 	"flag"
+	"io/ioutil"
+	"net/http"
 	"time"
 
 	logrus "github.com/Sirupsen/logrus"
+	aws "github.com/aws/aws-sdk-go/aws"
+	session "github.com/aws/aws-sdk-go/aws/session"
 	route53 "github.com/aws/aws-sdk-go/service/route53"
 )
 
+const (
+	ipCheckURL = "http://curlmyip.org"
+)
+
 var (
-	dnsTTL         = flag.Int("dnsttl", 300, "TTL for any DNS records created")
-	hostName       = flag.String("hostname", "host.domain.com.", "The hostname to update")
-	hostUpdateFreq = flag.Duration("hostupdate", "60m", "How often to update the record")
-	hostedZoneId   = flag.String("zoneid", "XYWQJHASDJHG.", "The Route53 Zone-ID")
 	awsRegion      = flag.String("awsregion", "eu-west-1", "The AWS region to connect to")
-	logger         *logrus.Logger
+	debug          = flag.Bool("debug", false, "Debug logging")
+	dnsTTL         = flag.Int64("ttl", 900, "TTL for any DNS records created")
+	hostedZoneId   = flag.String("zoneid", "XYWQJHASDJHG.", "The Route53 Zone-ID")
+	hostName       = flag.String("hostname", "host.domain.com.", "The hostname to update")
+	hostUpdateFreq = flag.Duration("frequency", 60*time.Minute, "How often to update the record")
+	route53Service *route53.Route53
 )
 
 func init() {
@@ -22,52 +31,83 @@ func init() {
 	flag.Parse()
 
 	// Set up a logger:
-	logger = logrus.Logger{
-		Formatter: &logrus.JSONFormatter{},
+	logrus.SetFormatter(&logrus.JSONFormatter{})
+	if *debug {
+		logrus.SetLevel(logrus.DebugLevel)
+	} else {
+		logrus.SetLevel(logrus.InfoLevel)
 	}
-
 }
 
 func main() {
 
-	// Create a session to share configuration, and load external configuration.
-	sess := session.Must(session.NewSession())
-
 	// Create the service's client with the session.
-	route53Service := route53.New(session.New(), aws.NewConfig().WithRegion(awsRegion))
+	logrus.Debug("Connecting to AWS")
+	route53Service = route53.New(session.New(), aws.NewConfig().WithRegion(*awsRegion))
+
+	updateRecord()
 
 	// A ticker to tell us when its time to update DNS:
-	updateTimer := time.Tick(hostUpdateFreq)
+	updateTimer := time.Tick(*hostUpdateFreq)
 
 	// Wait for the updateTimer to tell us its time to update the zone config:
 	for {
 		select {
 		case <-updateTimer:
-			logger.Debugf("Updating DNS record on schedule (%v)", hostUpdateFreq)
+			logrus.Infof("Updating DNS record on schedule (%v)", hostUpdateFreq)
 			updateRecord()
 		}
 	}
 
 }
 
-func updateRecord() {
+func updateRecord() error {
 
+	logrus.Debugf("Updating DNS record (%v)", hostUpdateFreq)
+
+	// Find out what our IP address is:
+	ipCheckResponse, err := http.Get(ipCheckURL)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"error": err}).Error("Couldn't check our IP address")
+		return err
+	}
+	ourIPAddress, err := ioutil.ReadAll(ipCheckResponse.Body)
+	defer ipCheckResponse.Body.Close()
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"error": err}).Error("Couldn't read ipCheckResponse.Body")
+		return err
+	}
+
+	// Make a ChangeResourceRecordSetsInput:
 	changeResourceRecordSetsInput := &route53.ChangeResourceRecordSetsInput{
 		ChangeBatch: &route53.ChangeBatch{
 			Changes: []*route53.Change{
-				Action: "UPSERT",
-				ResourceRecordSet: &route53.ResourceRecordSet{
-					Name: hostname,
+				&route53.Change{
+					Action: aws.String("UPSERT"),
+					ResourceRecordSet: &route53.ResourceRecordSet{
+						Name: hostName,
+						TTL:  dnsTTL,
+						Type: aws.String("A"),
+						ResourceRecords: []*route53.ResourceRecord{
+							&route53.ResourceRecord{
+								Value: aws.String(string(ourIPAddress)),
+							},
+						},
+					},
 				},
 			},
 		},
 		HostedZoneId: hostedZoneId,
 	}
 
-	err := route53Service.ChangeResourceRecordSets(changeResourceRecordSetsInput)
+	// Make the ChangeResourceRecordSets request:
+	_, err = route53Service.ChangeResourceRecordSets(changeResourceRecordSetsInput)
 	if err != nil {
-		logger.WithFields(logrus.Fields{"error": err}).Error("Couldn't update DNS record")
-	} else {
-		logger.WithFields(logrus.Fields{"hostname": hostname}).Error("Couldn't update DNS record")
+		logrus.WithFields(logrus.Fields{"error": err}).Error("Couldn't update DNS record")
+		return err
 	}
+
+	logrus.WithFields(logrus.Fields{"hostname": *hostName, "address": string(ourIPAddress), "ttl": *dnsTTL, "zone_id": *hostedZoneId}).Infof("Updated DNS record")
+
+	return nil
 }
